@@ -66,6 +66,34 @@ class BazelBuildResult:
     time_taken: float = 0.0
 
 
+@dataclasses.dataclass(frozen=True)
+class BazelBuildConfig:
+    """A Bazel invocation that CI runs and that the bot must keep passing."""
+
+    # Name of the configuration.
+    name: str
+
+    # Extra flags and targets passed to the bazel-build scripts. When empty, the
+    # scripts build their default targets with no extra flags.
+    args: Tuple[str, ...] = ()
+
+
+# These must stay in sync with the Bazel invocations run by CI (buildkite and
+# the "Bazel Checks" workflow in llvm-project/.github/workflows/bazel-checks.yml).
+BAZEL_BUILD_CONFIGS: Tuple[BazelBuildConfig, ...] = (
+    BazelBuildConfig(
+        name="default",
+    ),
+    BazelBuildConfig(
+        name="llvm_libc_fullbuild",
+        args=(
+            "--@llvm-project//libc:build_mode=full",
+            "@llvm-project//libc/...",
+        ),
+    ),
+)
+
+
 class CredentialManager:
     def __init__(self, use_github_app: bool):
         self.gh_fork_user = os.getenv("GITHUB_FORK_USER")
@@ -106,9 +134,46 @@ class CommandProcessor:
     def bazel_build_in_kubernetes(self) -> bool:
         return os.getenv("POD_NAME") is not None
 
-    def run_bazel_build(self) -> BazelBuildResult:
+    def run_bazel_build(
+        self,
+        configs: Sequence[BazelBuildConfig] = BAZEL_BUILD_CONFIGS,
+    ) -> BazelBuildResult:
         """
-        Runs the bazel build command in the given repository path for specific targets.
+        Runs the bazel build for each of the given configurations.
+
+        Configurations are built in order and the first failing configuration
+        stops the build. On failure, stderr is prefixed with a description of
+        the configuration that failed.
+
+        Returns:
+            BazelBuildResult containing status, stdout, stderr, and time taken.
+        """
+        total_time = 0.0
+        stdout = []
+        for config in configs:
+            result = self._run_bazel_build_with_config(config)
+            total_time += result.time_taken
+            stdout.append(result.stdout)
+            if not result.success:
+                header = f"Bazel build failed for configuration '{config.name}'"
+                if config.args:
+                    header += f" (extra arguments: {' '.join(config.args)})"
+                return BazelBuildResult(
+                    success=False,
+                    stdout=result.stdout,
+                    stderr=f"{header}:\n{result.stderr}",
+                    time_taken=total_time,
+                )
+        return BazelBuildResult(
+            success=True, stdout="\n\n".join(stdout), time_taken=total_time
+        )
+
+    def _run_bazel_build_with_config(
+        self,
+        config: BazelBuildConfig,
+    ) -> BazelBuildResult:
+        """
+        Runs the bazel build command in the given repository path for a single configuration.
 
         Returns:
             BazelBuildResult containing status, stdout, stderr, and time taken.
@@ -120,18 +185,23 @@ class CommandProcessor:
             base_path = os.path.dirname(os.path.abspath(__file__))
             bazel_build_path = os.path.join(base_path, bazel_build_file)
 
-            logger.info("Running bazel build...")
+            env = os.environ.copy()
+            if config.name != "default":
+                env["BAZEL_OUTPUT_BASE"] = f"/dev/shm/bazel_build_{config.name}"
+
+            logger.info(f"Running bazel build ({config.name})...")
             start_time = time.time()
             result = subprocess.run(
-                [bazel_build_path],
+                [bazel_build_path, *config.args],
                 cwd=os.path.join(self.repo_path, self.BazelPath),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=1800,  # 30 minutes
             )
             end_time = time.time()
             time_taken = end_time - start_time
-            logger.info(f"Bazel build took {time_taken} seconds.")
+            logger.info(f"Bazel build ({config.name}) took {time_taken} seconds.")
             return BazelBuildResult(
                 success=result.returncode == 0,
                 stdout=result.stdout,
